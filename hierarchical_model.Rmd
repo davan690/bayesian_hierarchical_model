@@ -1,0 +1,889 @@
+---
+title: "Bayesian Hierarchical Modelling"
+author: "Alex Turner"
+subtitle: An Adventure in Bayesian Probability with Coin Flipping
+output:
+  html_document:
+    df_print: paged
+---
+
+## Introduction
+
+This analysis focuses on the concept of Bayesian hierarchical modelling and how it can be used to estimate multiple dependent parameters at simultaneously. The technique will be demonstrated with the use of coin flips for simplicity. What will be highlighted is the flexibility and usefulness of these models in general. 
+
+The analysis will be implemented using [__JAGS__](http://mcmc-jags.sourceforge.net/) (Just Another Gibbs Sampler) software and the `rjags` R package. The examples have been adapted from the book [__Doing Bayesian Data Analysis__](https://sites.google.com/site/doingbayesiandataanalysis/) by John Kruschke.
+
+## Required Packages
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(ggmcmc)
+library(rjags)
+```
+
+## Overview of Bayes' Theorem & Hierarchical Modelling
+
+Bayesian hierarchical modelling is an extension of the [__Bayes' theorem__](https://en.wikipedia.org/wiki/Bayes%27_theorem) that allows for the estimation of multiple dependent parameters in the one model. 
+
+Bayes' theorem is of course the following:
+
+$$
+\begin{aligned}
+P(A | B) = \frac{P(B | A) P(A)} {P(B)}
+\end{aligned}
+$$
+
+The probability that event A occurs given event B has occurred is the product of the conditional probability of B given A and marginal probability of A, divided by the marginal probability of B. 
+
+It is basically saying given we know event B has occurred (possibly by assumption), what is the probability of event A occurring? 
+
+The probability of event A occurring is a function of the [__likelihood__](https://en.wikipedia.org/wiki/Likelihood_function), $P(B | A)$, and the [__marginal probabilities__](https://en.wikipedia.org/wiki/Marginal_distribution) $P(A)$ and $P(B)$. Bayesian analysis differs from frequentest statistics as [__prior belief__](https://en.wikipedia.org/wiki/Prior_probability) of the event A occurring can be expressed via $P(A)$ (in frequentest statistics, as the name suggests, probability is not concerned with degree of belief but rather the [__relative frequency of events__](https://en.wikipedia.org/wiki/Frequentist_probability)). If there is no reliable prior information regarding $P(A)$, a non-informative prior can be implemented and estimates will be the same as if [__maximum likelihood estimation__](https://en.wikipedia.org/wiki/Maximum_likelihood_estimation) was used. $P(A | B)$ is known as the [__posterior probability__](https://en.wikipedia.org/wiki/Posterior_probability) in Bayesian settings and is what is used to make inferences. 
+
+In practical settings Bayes' theorem is used in the following way:
+
+$$
+\begin{aligned}
+P(parameters | data) = \frac{P(data | parameters) P(parameters)} {P(data)}
+\end{aligned}
+$$
+
+Where $P(data)$ is simply a normalising constant that ensures the posterior integrates to 1, so it can be ignored and the formula rewritten as:
+
+$$
+\begin{aligned}
+P(parameters | data) \propto P(data | parameters) P(parameters)
+\end{aligned}
+$$
+
+So Bayesian analysis involves computing the posterior probabilities of the parameters of interest given some data has been observed and there was some prior belief (whether informative or not) about the probability of the parameters. 
+
+This brings us to the next point: in Bayesian analysis parameters are treated as random variables (that have probability density functions) rather than fixed constants (as is the case in frequentest statistics). The beauty of this approach is it allows for the extension of Bayes' theorem to more complex examples in which multiple parameters, that depend on each other, can be estimated in the one model. As will be demonstrated, this is extremely useful in practical settings. 
+
+In this analysis an extra parameter will be added to make Bayes' theorem become:
+
+$$
+\begin{aligned}
+P(\theta, \omega | D) = \frac{P(D | \theta, \omega) P(\theta, \omega)} {P(D)}
+\end{aligned}
+$$
+
+From here a few adjustments can be made. Firstly, the likelihood function does not depend on $\omega$, so we have:
+
+$$
+\begin{aligned}
+P(\theta, \omega | D) = \frac{P(D | \theta) P(\theta, \omega)} {P(D)}
+\end{aligned}
+$$
+
+Then, of course, the joint probability of $\theta$ and $\omega$ can be rewritten as the following given they are dependent:
+
+$$
+\begin{aligned}
+P(\theta, \omega | D) = \frac{P(D | \theta) P(\theta | \omega) P(\omega)} {P(D)}
+\end{aligned}
+$$
+
+And finally we ignore $P(D)$ and insert the 'proportional to' symbol:
+
+$$
+\begin{aligned}
+P(\theta, \omega | D) \propto P(D | \theta) P(\theta | \omega) P(\omega)
+\end{aligned}
+$$
+
+To summarise the above equation, we are now estimating both the posteriors of $\theta$ and $\omega$ in a single model with a hierarchical structure and dependencies. To be clear, the dependencies are as follows. The data depends only on the value of $\theta$ and $\theta$ is dependent of the value of $\omega$. Additionally, $\theta$ is conditionally independent of all other parameter values. Hierarchical models are typically used when there are multiple lower level parameters ($\theta_1, \theta_2$ etc) and one high level parameter for the system (in this case $\omega$). 
+
+Another way to think about the hierarchical model is that instead of simply using a fixed distribution for $\omega$, which would be the prior distribution in a typical Bayesian analysis, we are estimating the posterior distribution of this parameter using the data. The parameters of the $\omega$ distribution are known as [__hyperparameters__](https://en.wikipedia.org/wiki/Hyperparameter), which means they are the parameters of a prior distribution. The benefit of this approach is it allows for all the data to help estimate the higher level parameters of the system, which then in turn inform each of the lower level the parameters. When hyperparameters are used we must also use [__hyperpriors__](https://en.wikipedia.org/wiki/Hyperprior).
+
+All of this will be demonstrated via examples to follow.
+
+## Data Prep
+
+The data being used for this analysis is 8 fair coins flipped 10 times each, with the total number of heads recorded. The code below generates this automatically. Additionally, the coins are being grouped by which mint manufactured them. The first 4 coins are from Mint 1 and the others from Mint 2. The multiple mints will only be used in the final stage of the analysis as the first four models assume only a single mint. 
+
+```{r eval=FALSE}
+# create data frame of heads / tails data
+ht_df <- replicate(8, replicate(10, runif(1, 0, 1))) %>% 
+  as_tibble() %>% 
+  mutate_all(~ if_else(. > 0.5, "H", "T"))
+
+colnames(ht_df) <- map_chr(1:8, ~ paste0("coin_", .))
+```
+
+```{r include=FALSE}
+ht_df <- data_frame(
+  coin_1 = c("T", "T", "H", "T", "H", "T", "T", "T", "H", "T"),
+  coin_2 = c("H", "H", "H", "T", "H", "T", "T", "T", "H", "H"),
+  coin_3 = c("H", "T", "T", "H", "T", "T", "H", "H", "T", "T"),
+  coin_4 = c("H", "T", "T", "T", "H", "T", "T", "H", "H", "H"),
+  coin_5 = c("T", "T", "H", "H", "T", "T", "H", "T", "T", "H"),
+  coin_6 = c("T", "T", "T", "T", "H", "H", "T", "T", "H", "H"),
+  coin_7 = c("H", "T", "T", "T", "T", "T", "H", "T", "T", "T"),
+  coin_8 = c("T", "H", "H", "T", "T", "H", "T", "T", "T", "H")
+)
+```
+
+
+## Data
+
+```{r}
+# data
+ht_df
+
+# convert to long format for plot
+ht_df_long <- ht_df %>% 
+  gather(variable, value) %>% 
+  mutate(mint = c(rep("Mint 1", 40), rep("Mint 2", 40)) %>% factor()) %>% 
+  rename(coin = variable)
+
+# convert variable column (coins) to factor
+ht_df_long$coin <- ht_df_long$coin %>% 
+  factor(labels = map_chr(1:8, ~ paste("Coin", .)))
+
+# long format data
+ht_df_long
+```
+
+
+## Data Summary - Total Proportion of Heads
+
+```{r}
+# total proportion of heads observed
+total_prop <- ht_df_long %>% 
+  filter(value == "H") %>% 
+  summarise(prop = n() / 80) %>% 
+  pull()
+
+names(total_prop) <- "total_prop"
+
+total_prop
+```
+
+## Data Summary - Total Proportion of Heads by Mint
+
+```{r}
+# proportion of heads by mint
+mint_props <- ht_df_long %>%
+  group_by(mint) %>% 
+  filter(value == "H") %>% 
+  summarise(prop = n() / 40) %>% 
+  pull(prop)
+
+names(mint_props) <- c("mint_1", "mint_2")
+
+mint_props
+```
+
+## Data Summary - Total Proportion of Heads by Coin
+
+```{r}
+# proportion of heads by coin
+coin_props <- ht_df_long %>% 
+  group_by(coin, value) %>% 
+  filter(value == "H") %>% 
+  summarise(prop = n() / 10) %>% 
+  pull(prop)
+
+names(coin_props) <- colnames(ht_df)
+
+coin_props
+```
+
+## Data Plot
+
+Below is a plot of the proportion of heads by coin along with the overall proportion (solid line), proportion of heads for Mint 1 (dashed line) and proportion of heads for Mint 2 (dotted line). 
+
+```{r fig.align='center'}
+# plot 
+ht_df_long %>% 
+  group_by(coin, value) %>% 
+  filter(value == "H") %>% 
+  summarise(prop = n() / 10,
+            mint = unique(mint)) %>% 
+  ggplot(aes(coin, prop, fill = mint)) +
+  geom_col() +
+  geom_hline(yintercept = total_prop, size = 1) +
+  geom_hline(yintercept = mint_props[1], size = 1, linetype = "dashed") +
+  geom_hline(yintercept = mint_props[2], size = 1, linetype = "dotted") +
+  scale_fill_brewer(palette = "Pastel2") +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.1), limits = c(0, 1)) +
+  labs(title = "Proportion of Heads by Coin",
+       x = "Coin",
+       y = "Proportion",
+       fill = "Mint") +
+  theme(legend.position = "bottom")
+```
+
+## Hierarchical Model Diagram
+
+Firstly, thanks to this [__GitHub user__](https://github.com/rasmusab/distribution_diagrams) for the distribution plots. 
+
+In the diagram each $\theta_c$ represents a coin and $\omega$ represents the mint. 
+
+As with all model diagrams, this should be read from the bottom up. Each coin is distribution as a binomial distribution (Bernoulli could also have been used) with $N = 10$ trials and a probability value of $\theta$ that is distributed as a [__beta__](https://en.wikipedia.org/wiki/Beta_distribution) distribution. This beta distribution is defined by the hyperparameters $\omega$, which is the mode, and $\kappa$, which is the level of concentration around the mode. Moving further up the hierarchy, it is shown that $\omega$ is also distributed as a beta distribution (this is a hyperprior) which is defined by the standard beta shape parameters $\alpha$ and $\beta$.
+
+As the beta prior is a [__conjugate prior__](https://en.wikipedia.org/wiki/Conjugate_prior) for the binomial likelihood, the posterior distributions will all be beta distributions. 
+
+<center>
+![](./model_diagram.png)
+</center>
+
+The model diagram will require some tweaks for the later stages of the analysis, which will be outlined.
+
+## Reparameterisation & Dependency
+
+In the model diagram a few things need to be explained further. Firstly, notice there is a $\theta$ value for each coin denoted by $\theta_c$. As stated previously, these values are conditionally independent of each other but depend on the higher level $\omega$ parameter. Secondly, the beta prior for each $\theta_c$ has been reparameterised to be expressed in terms of its mode (denoted by $\omega$) and concentration (denoted by $\kappa$), rather than the usual $\alpha$ and $\beta$ shape parameters. The hyperparameter $\omega$ has a beta hyperprior, which is necessary as the beta distribution mode obviously must be constrained to the interval $[0, 1]$. Finally, the concentration hyperparameter $\kappa$ has no prior as this will take fixed values in each of the examples. It can alternatively have a hyperprior as well if this was preferred.
+
+The reason $\kappa$ will take fixed values is it is used to specify the level of dependence between the lower level $\theta_c$ parameters and $\omega$. A low value of value of $\kappa$ indicates the prior has a relatively low concentration around its mode and, as a consequence of this, the lower level parameters are essentially given more freedom. In this situation there is low dependency between values of $\theta_c$ and $\omega$. The opposite is true when $\kappa$ is large as the concentration around the mode is high. This constrains each $\theta_c$ to be closer to $\omega$ as there is essentially high degree of belief in this overall parameter value, which informs all the lower level parameters. 
+
+## Data for JAGS
+
+The below code transforms the data into a format that JAGS can handle. 
+
+```{r}
+# number of flips by coin
+N <- ht_df_long %>% 
+  group_by(coin) %>% 
+  count() %>% 
+  pull(n) 
+
+# number of heads by coin
+z <- ht_df_long %>%  
+  group_by(coin) %>% 
+  summarise(z = (value == "H") %>% sum()) %>% 
+  pull(z)
+
+# mints
+m <- c( 
+  rep(unique(ht_df_long$mint) %>% as.numeric() %>% .[1], 4),
+  rep(unique(ht_df_long$mint) %>% as.numeric() %>% .[2], 4)
+) 
+
+# total number of coins
+n_c <- ht_df_long$coin %>% 
+  unique() %>% 
+  length() 
+
+# data list for JAGS
+data_list <- list(
+  N = N,
+  z = z,
+  n_c = n_c
+)
+```
+
+## Model 1: High Dependency & Vague Hyperprior 
+
+The first iteration of the hierarchical model will feature high dependency between each $\theta_c$ and $\omega$, implemented with $\kappa = 50$. The hyperprior for $\omega$ will be vague ($\alpha = 1, \beta = 1$, which is the same a uniform distribution over the internal $[0, 1]$).
+
+The code below implements the Bayesian hierarchical model in JAGS. For this analysis the dataset is very small, allowing for multiple long chains (100,000 iterations each) to be used. This not absolutely necessary but is being opted for as it results in very stable estimates and is only possible when datasets are small and the model lacks complexity (or you have a _lot_ of time). JAGS uses [__Markov Chain Monte Carlo__](https://en.wikipedia.org/wiki/Markov_chain_Monte_Carlo) methods, more specifically [__Gibbs sampling__](https://en.wikipedia.org/wiki/Gibbs_sampling), to sample from the posterior distributions.
+
+```{r}
+# JAGS model block
+model_string <- "
+model {
+  for (c in 1:n_c) {
+    z[c] ~ dbin(theta[c], N[c])
+    theta[c] ~ dbeta(omega * (50 - 2) + 1, (1 - omega) * (50 - 2) + 1)
+  }
+  omega ~ dbeta(1, 1)
+}
+"
+
+writeLines(model_string, "jagsmodel.txt")
+
+chain_length <- 100000 # chain length
+n_chains <- 3 # number of chains
+n_adapt <- 1000 # adaptation period
+burn_in <- ceiling(0.005 * chain_length) # burn in
+
+# run model
+jags_model <- jags.model(
+  file = "jagsmodel.txt",
+  data = data_list,
+  n.chains = n_chains,
+  n.adapt = n_adapt
+)
+
+# update for burn in
+update(jags_model, n.iter = burn_in)
+
+# posterior paramaters 
+thetas <- map_chr(1:8, ~ paste0("theta[", ., "]"))
+
+parameters <- c("omega", thetas)
+
+# posterior samples
+coda_samples <- coda.samples(
+  jags_model,
+  variable.names = parameters,
+  n.iter = chain_length
+) 
+```
+
+## MCMC Diagnostics
+
+All of the MCMC diagnostics will be at the end of the analysis in an appendix to avoid cluttering things.
+
+## Posterior Samples 
+
+Once the model has been run and the posterior distributions sampled from the data can be put into a data frame for plotting and analysis. This will only be shown for this first model.
+
+```{r}
+# create data frame of posterior samples
+post_samples_1 <- coda_samples %>% ggs()
+
+post_samples <- post_samples_1 %>% 
+  mutate(parameter_fill = c(rep("omega", 300000), rep("theta", 2400000)) %>% factor())
+
+# posterior samples data
+post_samples
+```
+
+## Posterior Distributions Function
+
+The function below will be used to plot the posterior distributions for all parameters.
+
+```{r}
+# function for plotting posterior distributions
+post_dist_fun <- function(x, t_p) {
+  ggplot(x, aes(value, fill = fct_inorder(parameter_fill))) +
+    geom_histogram(bins = 100, colour = "white", alpha = 0.8) +
+    geom_vline(xintercept = t_p, size = 0.8,) +
+    facet_grid(Parameter ~ .) +
+    scale_fill_manual(values = RColorBrewer::brewer.pal(8, "Dark2")[c(5:6, 4)]) +
+    scale_x_continuous(limits = c(0, 1),
+                       breaks = seq(0, 1, by = 0.1)) +
+    labs(title = "Posterior Distributions",
+         x = "Value",
+         y = "Count") +
+    guides(fill = F) +
+    theme(strip.text.y = element_text(angle = 0))
+}
+```
+
+## Model 1: Posterior Distributions
+
+For all posterior distribution the overall classical estimate ($\frac{total.heads} {total.flips}$) will be indicated with the black line. Also, the $\omega$ posterior distribution will at the top of the grid and coloured green for the initial parts of the analysis.
+
+The vague hyperprior for $\omega$ means the posterior distribution for this higher-level parameter is centered around the overall proportion of heads observed. Due to the high dependency between the lower-level $\theta_c$ parameters and $\omega$, all of the individual coin posterior estimates are pulled towards the overall proportion of heads. The $\omega$ distribution dominates the entire system despite some coins having very different observed proportions to the overall level. 
+
+Another way to think about the high dependency is that with a large value of $\kappa$ we are telling the system that the certainty in $\omega$ is very high and, as a result, the posterior is tightly grouped around this mode value (the overall observed proportion of heads). This certainty then cascades down the hierarchy to be highly informative to each $\theta_c$. The result is each $\theta_c$ posterior is highly concentrated around its mode.
+
+```{r fig.align='center'}
+# posterior distributions
+post_dist_fun(post_samples, total_prop)
+```
+
+## Model 2: Low Dependency & Vague Hyperprior
+
+The second hierarchical model will feature low dependency between each $\theta_c$ and $\omega$, implemented with $\kappa = 5$. The hyperprior for $\omega$ will be vague ($\alpha = 1, \beta = 1$).
+
+```{r}
+# JAGS model block
+model_string <- "
+model {
+  for (c in 1:n_c) {
+    z[c] ~ dbin(theta[c], N[c])
+    theta[c] ~ dbeta(omega * (5 - 2) + 1, (1 - omega) * (5 - 2) + 1)
+  }
+  omega ~ dbeta(1, 1)
+}
+"
+
+writeLines(model_string, "jagsmodel.txt")
+
+# run model
+jags_model <- jags.model(
+  file = "jagsmodel.txt",
+  data = data_list,
+  n.chains = n_chains,
+  n.adapt = n_adapt
+)
+
+# update for burn in
+update(jags_model, n.iter = burn_in)
+
+# posterior samples
+coda_samples <- coda.samples(
+  jags_model,
+  variable.names = parameters,
+  n.iter = chain_length
+) 
+
+# create data frame of posterior samples
+post_samples_2 <- coda_samples %>% ggs()
+
+post_samples <- post_samples_2 %>% 
+  mutate(parameter_fill = c(rep("omega", 300000), rep("theta", 2400000)) %>% factor())
+```
+
+## Model 2: Posterior Distributions
+
+With another vague hyperprior for $\omega$ the posterior is informed completely from the data. This time the results are not as intuitive, though. Now the mode of the posterior for $\omega$ is not located at the overall proportion of heads observed as one might expect. The reason for this is the low value of $\kappa$ removes the certainty around the estimate of $\omega$ and makes the posterior distribution vulnerable to outliers. The reason for this the outlying coins with a proportion of heads relatively close to 0 or 1 have much more certainty in their likelihood functions compared to coins with ~ 5 heads observed. This certainty in the likelihood allows the outlying coins to have disproportionately large impact on the posterior distribution of $\omega$, dragging it away from the overall observed proportion of heads and toward the outlier. 
+
+The other clear difference with these posteriors compared to the previous is they are all relatively spread and the individual $\theta_c$ distributions all have a modal value that is much closer to the observed number of heads for that individual coin. This stems from the low $\kappa$ value that indicates low dependency between each $\theta_c$ and $\omega$. Each $\theta_c$ is essentially given much more freedom and less certainty in this model. 
+
+```{r fig.align='center'}
+# posterior distributions
+post_dist_fun(post_samples, total_prop)
+```
+
+## Model 3: High Dependency & Informative Hyperprior
+
+The third version of the hierarchical model will feature high dependency between each $\theta_c$ and $\omega$, implemented with $\kappa = 50$ (as was the case in the first model). The hyperprior for $\omega$ will now be informative ($\alpha = 20, \beta = 20$), with the prior knowledge indicating the coins are fair.
+
+```{r}
+# JAGS model block
+model_string <- "
+model {
+  for (c in 1:n_c) {
+    z[c] ~ dbin(theta[c], N[c])
+    theta[c] ~ dbeta(omega * (50 - 2) + 1, (1 - omega) * (50 - 2) + 1)
+  }
+  omega ~ dbeta(20, 20)
+}
+"
+
+writeLines(model_string, "jagsmodel.txt")
+
+# run model
+jags_model <- jags.model(
+  file = "jagsmodel.txt",
+  data = data_list,
+  n.chains = n_chains,
+  n.adapt = n_adapt
+)
+
+# update for burn in
+update(jags_model, n.iter = burn_in)
+
+# posterior samples
+coda_samples <- coda.samples(
+  jags_model,
+  variable.names = parameters,
+  n.iter = chain_length
+) 
+
+# create data frame of posterior samples
+post_samples_3 <- coda_samples %>% ggs()
+
+post_samples <- post_samples_3 %>% 
+  mutate(parameter_fill = c(rep("omega", 300000), rep("theta", 2400000)) %>% factor())
+```
+
+## Model 3: Posterior Distributions
+
+The output looks similar to the first model but with a key difference: the posterior for $\omega$ is now closer to 0.5 due to the hyperprior. This can clearly be seen by the difference in the mode for the $\omega$ distribution and the line showing the observed proportion of heads (in the first model these values were essentially the same). The effect of the prior on $\omega$ then flows down to each $\theta_c$, due to the high dependency, as they are all now closer to 0.5 than in the first model. 
+
+This model features the most certain posterior distribution for $\omega$, due to the informative hyperprior and the high certainty conveyed via $\kappa = 50$. Both of these contribute to a narrow posterior. 
+
+```{r fig.align='center'}
+# posterior distributions
+post_dist_fun(post_samples, total_prop)
+```
+
+## Model 4: Low Dependency & Informative Hyperprior
+
+The fourth, and final for these initial models, installment of the hierarchical model will feature low dependency between each $\theta_c$ and $\omega$, implemented with $\kappa = 5$. The hyperprior for $\omega$ will be informative ($\alpha = 20, \beta = 20$), with the prior knowledge indicating the coins are fair.
+
+```{r}
+# JAGS model block
+model_string <- "
+model {
+  for (c in 1:n_c) {
+    z[c] ~ dbin(theta[c], N[c])
+    theta[c] ~ dbeta(omega * (5 - 2) + 1, (1 - omega) * (5 - 2) + 1)
+  }
+  omega ~ dbeta(20, 20)
+}
+"
+
+writeLines(model_string, "jagsmodel.txt")
+
+# run model
+jags_model <- jags.model(
+  file = "jagsmodel.txt",
+  data = data_list,
+  n.chains = n_chains,
+  n.adapt = n_adapt
+)
+
+# update for burn in
+update(jags_model, n.iter = burn_in)
+
+# posterior samples
+coda_samples <- coda.samples(
+  jags_model,
+  variable.names = parameters,
+  n.iter = chain_length
+) 
+
+# create data frame of posterior samples
+post_samples_4 <- coda_samples %>% ggs()
+
+post_samples <- post_samples_4 %>% 
+  mutate(parameter_fill = c(rep("omega", 300000), rep("theta", 2400000)) %>% factor())
+```
+
+## Model 4: Posterior Distributions
+
+This set of posterior distributions look the most odd at first. As a result of the hyperprior we end up with a very certain posterior estimate for $\omega$ but, due to the lack of dependency, each of the individual $\theta_c$ distributions are much less certain. Each $\theta_c$ also centered away from $\omega$ in cases where the coin had an observed proportion of heads that differed from the overall level. 
+
+The reason the above is true is because the hyperprior for the coins being fair was highly informative, which reduces the spread of the $\omega$ posterior distribution and centers it closer to 0.5. This is in contrast to the second model (which also had low dependency) that had a very uncertain posterior for $\omega$. Additionally, the low dependency between parameters that allows each $\theta_c$ freedom to have the posteriors we see below, which are not necessarily close to $\omega$.
+
+```{r fig.align='center'}
+# posterior distributions
+post_dist_fun(post_samples, total_prop)
+```
+
+## Switching to Two Mints
+
+In the previous four models it has been assumed that all coins came from the same mint. This is not a requirement for hierarchical modelling. The number of mints can be expanded to two (or more) and this will be demonstrated in the following examples. 
+
+## Model Diagram
+
+The model diagram requires a slight adjustment as now there are two $\omega_m$ values to be estimated - one for each mint.
+
+<center>
+![](./model_diagram_2.png)
+</center>
+
+## Data for JAGS
+
+The below code updates the data list for JAGS to split the coins into 2 mints.
+
+```{r}
+# total number of mints
+n_m <- ht_df_long$mint %>% 
+  unique() %>% 
+  length() 
+
+# update data list for JAGS
+data_list <- list(
+  N = N,
+  z = z,
+  m = m,
+  n_c = n_c,
+  n_m = n_m
+)
+```
+
+## Mutliple Mints Model: High Dependency & Vague Hyperprior
+
+The multiple mint hierarchical model will feature high dependency between each $\theta_c$ and their $\omega_m$ (for each of the two mints), implemented with $\kappa = 50$. The hyperprior for each $\omega_m$ will be non-informative ($\alpha = 1, \beta = 1$).
+
+```{r}
+# JAGS model block
+model_string <- "
+model {
+  for (c in 1:n_c) {
+    z[c] ~ dbin(theta[c], N[c])
+    theta[c] ~ dbeta(omega[m[c]] * (50 - 2) + 1, (1 - omega[m[c]]) * (50 - 2) + 1)
+  }
+  for (m in 1:n_m) {
+    omega[m] ~ dbeta(1, 1)
+  }
+}
+"
+
+writeLines(model_string, "jagsmodel.txt")
+
+# run model
+jags_model <- jags.model(
+  file = "jagsmodel.txt",
+  data = data_list,
+  n.chains = n_chains,
+  n.adapt = n_adapt
+)
+
+# update for burn in
+update(jags_model, n.iter = burn_in)
+
+# update posterior paramaters 
+parameters <- c("omega[1]", "omega[2]", thetas)
+
+# posterior samples
+coda_samples <- coda.samples(
+  jags_model,
+  variable.names = parameters,
+  n.iter = chain_length
+) 
+
+# create data frame of posterior samples
+post_samples_m <- coda_samples %>% 
+  ggs() 
+
+post_samples <- post_samples_m %>% 
+  mutate(parameter_fill = c(
+    rep("mint_1", 300000), 
+    rep("mint_2", 300000),
+    rep("mint_1", 1200000),
+    rep("mint_2", 1200000)) %>% 
+      factor()
+  )
+```
+
+## Multiple Mints Model: Posterior Distributions
+
+The colours of the posterior distributions are now used to show which coins are from which mint (green for Mint 1, yellow for Mint 2). 
+
+These posterior distributions are obviously very different to what we have seen previously. One key aspect of the multiple mint model is all the coins from Mint 1 have no impact on $\omega_2$ and vice versa. This also means each $\omega_m$ only informs the coins from that mint. This is intuitive but worth stating explicitly for clarity. What has just been explained is obvious when looking at the posterior distributions. There is a clear split into two distinct groups due to the fact there are now multiple mints. It is particularly noticeable in this example as there is high dependency and each mint had a different overall proportion of heads observed (made clear by the fact neither $\omega_m$ posterior mode is near the overall proportion of heads observed). 
+
+This model essentially works in the same way to first model that also had a vague prior and high dependency but now there is $\omega_1$ and $\omega_2$ and then four coins below each in the hierarchy. The high dependency means each $\theta_c$ posterior distribution is drawn close its $\omega_m$ distribution. 
+
+```{r fig.align='center'}
+# posterior distributions
+post_dist_fun(post_samples, total_prop) 
+```
+
+## Extending the Model Further
+
+Rather than re-do more of the first examples with the two mint structure, the final piece of the analysis will add another layer to the hierarchical model. Now, there will still be two mints but there will also be an additional higher-level parameter that sits above the mints in the hierarchy. This could perhaps be thought of as there are two mints that are owned by the one coin manufacturing company. 
+
+## Model Diagram
+
+Extending the model diagram is necessary to add the extra higher-level parameter. The model reads the same as the two mint example and the initial model (that was most thoroughly explained), but with an extra layer in the hierarchy so that the overall $\omega_0$ can be now estimated too. There is also now $\kappa_1$ and $\kappa_2$ to differentiate between the dependency of each $\theta_c$ on the relevant $\omega_m$ and each $\omega_m$ on the overall $\omega_0$. In this model all the coins help inform the overall $\omega_0$ which then informs each $\omega_m$. Of course, each $\omega_m$ then informs the coins from that mint and the hierarchical model works its magic. 
+
+<center>
+![](./model_diagram_3.png)
+</center>
+
+## Extended Mutliple Mints Model: High Dependency & Vague Hyperprior
+
+For consistency with the previous example the extension of the multiple mint hierarchical model will feature high dependency at both layers. For each $\theta_c$ and their $\omega_m$ and each $\omega_m$ and $\omega_0$ the high dependency is implemented with $\kappa_1 = 50, \kappa_2 = 50$. The prior for $\omega_0$ will be non-informative ($\alpha = 1, \beta = 1$).
+
+```{r}
+# JAGS model block
+model_string <- "
+model {
+  for (c in 1:n_c) {
+    z[c] ~ dbin(theta[c], N[c])
+    theta[c] ~ dbeta(omega[m[c]] * (50 - 2) + 1, (1 - omega[m[c]]) * (50 - 2) + 1)
+  }
+  for (m in 1:n_m) {
+    omega[m] ~ dbeta(omega_0 * (50 - 2) + 1, (1 - omega_0) * (50 - 2) + 1)
+  }
+  omega_0 ~ dbeta(1, 1)
+}
+"
+
+writeLines(model_string, "jagsmodel.txt")
+
+# run model
+jags_model <- jags.model(
+  file = "jagsmodel.txt",
+  data = data_list,
+  n.chains = n_chains,
+  n.adapt = n_adapt
+)
+
+# update for burn in
+update(jags_model, n.iter = burn_in)
+
+# update posterior paramaters 
+parameters <- c("omega_0", "omega[1]", "omega[2]", thetas)
+
+# posterior samples
+coda_samples <- coda.samples(
+  jags_model,
+  variable.names = parameters,
+  n.iter = chain_length
+) 
+
+# create data frame of posterior samples
+post_samples_e <- coda_samples %>% 
+  ggs() 
+  
+post_samples <- post_samples_e %>%   
+  mutate(
+    Parameter = Parameter %>% fct_relevel("omega_0"),
+    parameter_fill = c(
+      rep("mint_1", 300000),
+      rep("mint_2", 300000), 
+      rep("overall", 300000),
+      rep("mint_1", 1200000),
+      rep("mint_2", 1200000)
+    ) %>% factor()
+  )
+```
+
+## Extended Mutliple Mints Model: Posterior Distributions
+
+For these distributions the overall $\omega_0$ is at the top of the grid coloured green, $\omega_1$ and all the coins from that mint are coloured yellow and $\omega_2$ and its coins magenta. 
+
+Firstly, as expected we see the overall $\omega_0$ posterior distribution is centered around the overall proportion of heads and is highly concentrated around this value. This is because the vague hyperprior for $\omega_0$ means the data informs the estimate completely and the high value of $\kappa_2$ puts high certainty in this estimate. The high value of $\kappa_2$ means each $\omega_m$ is highly dependent on $\omega_0$ and, as a result, their posterior distributions are drawn toward it. This is more obvious when comparing their posteriors to that observed in the previous model where there were no higher-level parameters they were dependent on. 
+
+The high dependency between $\omega_0$ and each $\omega_m$ does not result in $\omega_0$ dominating the lower level parameters to the same degree that each $\omega_m$ dominates each $\theta_c$ when there is high dependency between these parameters. The reason for this is that each $\omega_m$ has more data informing it relative to each $\theta_c$. $\omega_0$ has all 80 data points informing it, each $\omega_m$ has 40 and each $\theta_c$ only 10. So the relative difference between 10 and 40 is obviously larger than 40 and 80. 
+
+As a result of this, each $\omega_m$ posterior is given some freedom as shown by the difference between their modal values and the overall proportion of heads observed (which is essentially the mode of the $\omega_0$ posterior). As each $\omega_m$ posterior distribution are substantially different, we again see two groups of lower level $\theta_c$ posteriors as each mint is providing different information to their coins through the high dependency. The posterior distribution for each $\theta_c$ is closer to the overall proportion of heads observed when compared to the previous model as there is now $\omega_0$ informing their distributions via each $\omega_m$.
+
+```{r fig.align='center'}
+# posterior distributions
+post_dist_fun(post_samples, total_prop) 
+```
+
+## Conclusion
+
+In conclusion, it has been shown that Bayesian hierarchical modelling provides a very effective way of estimating multiple dependent parameters. In the classical approach one would simply take the observed proportion of heads for each parameter. This is clearly a much more limited method than what has been demonstrated in this analysis. The hierarchy has no limitations in terms of how many levels can be added and there is freedom to specify different dependencies as appropriate. It was not demonstrated in this work but the $\kappa$ beta concentration parameters can also be estimated as part of the model, rather than being specified. Basically, the modelling technique has a great deal flexibility and this has a profound impact in terms of its practical application. This project used dummy coin flip data but this could be any real-world situation in which proportions were being calculated.
+
+## Appendix - MCMC Diagnostics
+
+The MCMC diagnostics show all models have chains that are representative, accurate and efficient. 
+
+* __Representativeness:__ this is shown by the trace plots and the density plots. The trace plots show all chains have not been influenced by the initial values and have settled into presumably desirable regions of the posterior distribution. No chains have gotten stuck at any point and all are shown to be mixing well, resulting in potential scale reduction factors values of 1. This indicates the within-chain and between-chain variances are equal and they have all converged. In addition to the trace plots, there also the density plots for assessing representativeness. As all density plots are almost perfectly overlapping and showing now unusual shapes, further indicating convergence to the true posterior.
+* __Accuracy:__ accuracy can be assessed by the autocorrelation plots. The autocorrelation plots show the correlation at any lag value (the ACF is of course always 1 at lag 0). For the chains with low dependency the autocorrelation drops off very quickly and is essentially 0 after less than 10 lags. This is not the case with the models that use high dependency, causing some autocorrelation even after 10 or so lags. The autocorrelation is not enough to be problematic though and the luxury being able to run such long chains affords is the effective sample size is basically guaranteed to be adequate. The reason for the autocorrelation under high dependency is due to the Gibbs sampling used by JAGS. Gibbs sampling involves sampling a new value for a given parameter from the full conditional distribution (given the data and all other parameter values). Under high dependency values of parameters depend on each other so each time a paramater value is sampled it is restricted to a certain space given other parameter values, which creats autocorrelation. 
+* __Efficiency:__ this autocorrelation in the high dependency examples does impact efficiency but with small, basic models such as these efficiency is of no great concern.  
+
+## Diagnostics Functions
+
+Firstly, some functions need to be built as the default options in `ggmcmc` don't work well with this many parameters.
+
+```{r}
+# MCMC diagnostics functions
+# trace plots
+plot_traceplot_omegas <- function(x) {
+  x %>%
+    filter(Parameter %in% c("omega_0", "omega[1]", "omega[2]", "omega")) %>% 
+    ggs_traceplot()
+}
+
+plot_traceplot_thetas <- function(x) {
+  p1 <- x %>%
+    filter(Parameter %in% thetas[1:4]) %>% 
+    ggs_traceplot()
+  p2 <- x %>%
+    filter(Parameter %in% thetas[5:8]) %>% 
+    ggs_traceplot()
+  cowplot::plot_grid(p1, p2)
+}
+
+# autocorrelation
+plot_autocorrelation_omegas <- function(x) {
+  x %>%
+    filter(Parameter %in% c("omega_0", "omega[1]", "omega[2]", "omega")) %>% 
+    ggs_autocorrelation()
+}
+
+plot_autocorrelation_thetas <- function(x) {
+  p1 <- x %>%
+    filter(Parameter %in% thetas[1:4]) %>% 
+    ggs_autocorrelation()
+  p2 <- x %>%
+    filter(Parameter %in% thetas[5:8]) %>% 
+    ggs_autocorrelation()
+  cowplot::plot_grid(p1, p2)
+}
+
+# shrink factor
+plot_rhat_omegas <- function(x) {
+  x %>%
+    filter(Parameter %in% c("omega_0", "omega[1]", "omega[2]", "omega")) %>% 
+    ggs_Rhat()
+}
+
+plot_rhat_thetas <- function(x) {
+  p1 <- x %>%
+    filter(Parameter %in% thetas[1:4]) %>% 
+    ggs_Rhat()
+  p2 <- x %>%
+    filter(Parameter %in% thetas[5:8]) %>% 
+    ggs_Rhat()
+  cowplot::plot_grid(p1, p2)
+}
+
+# density plots
+plot_density_omegas <- function(x) {
+  x %>%
+    filter(Parameter %in% c("omega_0", "omega[1]", "omega[2]", "omega")) %>% 
+    ggs_density()
+}
+
+plot_density_thetas <- function(x) {
+  p1 <- x %>%
+    filter(Parameter %in% thetas[1:4]) %>% 
+    ggs_density()
+  p2 <- x %>%
+    filter(Parameter %in% thetas[5:8]) %>% 
+    ggs_density()
+  cowplot::plot_grid(p1, p2)
+}
+```
+
+## Model 1 
+
+```{r fig.align='center'}
+plot_traceplot_omegas(post_samples_1)
+plot_traceplot_thetas(post_samples_1)
+plot_autocorrelation_omegas(post_samples_1)
+plot_autocorrelation_thetas(post_samples_1)
+plot_rhat_omegas(post_samples_1)
+plot_rhat_thetas(post_samples_1)
+plot_density_omegas(post_samples_1)
+plot_density_thetas(post_samples_1)
+```
+
+## Model 2 
+
+```{r fig.align='center'}
+plot_traceplot_omegas(post_samples_2)
+plot_traceplot_thetas(post_samples_2)
+plot_autocorrelation_omegas(post_samples_2)
+plot_autocorrelation_thetas(post_samples_2)
+plot_rhat_omegas(post_samples_2)
+plot_rhat_thetas(post_samples_2)
+plot_density_omegas(post_samples_2)
+plot_density_thetas(post_samples_2)
+```
+
+## Model 3
+
+```{r fig.align='center'}
+plot_traceplot_omegas(post_samples_3)
+plot_traceplot_thetas(post_samples_3)
+plot_autocorrelation_omegas(post_samples_3)
+plot_autocorrelation_thetas(post_samples_3)
+plot_rhat_omegas(post_samples_3)
+plot_rhat_thetas(post_samples_3)
+plot_density_omegas(post_samples_3)
+plot_density_thetas(post_samples_3)
+```
+
+## Model 4
+
+```{r fig.align='center'}
+plot_traceplot_omegas(post_samples_4)
+plot_traceplot_thetas(post_samples_4)
+plot_autocorrelation_omegas(post_samples_4)
+plot_autocorrelation_thetas(post_samples_4)
+plot_rhat_omegas(post_samples_4)
+plot_rhat_thetas(post_samples_4)
+plot_density_omegas(post_samples_4)
+plot_density_thetas(post_samples_4)
+```
+
+## Model - Multiple Mints
+
+```{r fig.align='center'}
+plot_traceplot_omegas(post_samples_m)
+plot_traceplot_thetas(post_samples_m)
+plot_autocorrelation_omegas(post_samples_m)
+plot_autocorrelation_thetas(post_samples_m)
+plot_rhat_omegas(post_samples_m)
+plot_rhat_thetas(post_samples_m)
+plot_density_omegas(post_samples_m)
+plot_density_thetas(post_samples_m)
+```
+
+## Model - Multiple Mints Extended
+
+```{r fig.align='center'}
+plot_traceplot_omegas(post_samples_e)
+plot_traceplot_thetas(post_samples_e)
+plot_autocorrelation_omegas(post_samples_e)
+plot_autocorrelation_thetas(post_samples_e)
+plot_rhat_omegas(post_samples_e)
+plot_rhat_thetas(post_samples_e)
+plot_density_omegas(post_samples_e)
+plot_density_thetas(post_samples_e)
+```
