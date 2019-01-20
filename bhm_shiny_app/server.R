@@ -3,6 +3,11 @@ library(tidyverse)
 # library(ggmcmc)
 # library(rjags)
 
+chain_length <- 100000 # chain length
+n_chains <- 3 # number of chains
+n_adapt <- 1000 # adaptation period
+burn_in <- ceiling(0.005 * chain_length) # burn in
+
 shinyServer(function(input, output) {
 
     coins_df <- eventReactive(input$flip_coins, {
@@ -53,6 +58,14 @@ shinyServer(function(input, output) {
                  fill = "Mint") +
             theme(legend.position = "bottom")
         
+    })
+    
+    wait_text <- eventReactive(input$run_jags, {
+        "Please wait for the MCMC process to be completed."
+    })
+    
+    output$please_wait <- renderText({
+        wait_text()
     })
 
 })
