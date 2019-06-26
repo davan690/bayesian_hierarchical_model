@@ -182,4 +182,11 @@ shinyServer(function(input, output) {
         post_dist_fun(jags_data(), temp_total_prop)
     })
     
+    url <- a("Bayesian Hierarchical Modelling", href = "https://turneralex.github.io/hierarchical_model.html")
+      
+      output$tab <- renderUI({
+        tagList("More information on this type of modelling
+                 can be found here:", url)
+    })
+    
 })

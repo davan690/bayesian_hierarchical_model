@@ -8,6 +8,8 @@ shinyUI(fluidPage(
         sidebarPanel(
             h5("Observe the effects of different levels of dependency & strength of certainity in the hyperprior
                by choosing different parameter settings for the same data."),
+            uiOutput("tab"),
+            h5(" "),
             selectInput("model_type",
                         "Choose the model parameters:",
                         choices = c("High Dependency & Vague Hyperprior",
